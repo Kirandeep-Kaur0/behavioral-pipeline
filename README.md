@@ -23,29 +23,57 @@ score, and actionable marketing lists.*
 
 ## Architecture
 
-EventProducer(s)  [3 threads — weighted random events]
-│
-▼  [LinkedBlockingQueue — bounded, back-pressure]
-EventQueue  (capacity: 500)
-│
-▼  [ThreadPoolExecutor — 3 named consumer workers]
-EventConsumer(s)
-│
-├──▶ UserProfileStore    (ConcurrentHashMap — thread-safe)
-│         │
-│         ▼
-│    SegmentClassifier   (real-time after every event)
-│         │
-│         ▼
-│    [HIGH_VALUE / HOT_LEAD / CART_ABANDONER / AT_RISK / NEW_USER]
-│
-└──▶ RuleEngine          (Strategy + Observer pattern)
-│
-▼
-TriggerEmailAction    (simulates SendGrid / Mailchimp API)
-LogAction             (audit trail)
-PipelineDashboard  (ScheduledExecutorService — fixed-rate 2s refresh)
+<pre>
+┌─────────────────────────────────────────────────────┐
+│              EventProducer x3 (Threads)             │
+│     Weighted random events — 23 events/sec total    │
+└──────────────────┬──────────────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│         EventQueue (LinkedBlockingQueue)             │
+│    Capacity: 500 — Back-pressure built-in           │
+│    Producers BLOCK when full. No event loss.        │
+└──────────────────┬──────────────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│       PipelineThreadPool (ThreadPoolExecutor)        │
+│   3 named consumer-worker threads — CallerRunsPolicy│
+│                                                     │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐  │
+│  │ Consumer-1  │ │ Consumer-2  │ │ Consumer-3  │  │
+│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘  │
+└─────────┼───────────────┼───────────────┼──────────┘
+          └───────────────┼───────────────┘
+                          │
+          ┌───────────────┴───────────────┐
+          │                               │
+          ▼                               ▼
+┌──────────────────────┐     ┌────────────────────────┐
+│   UserProfileStore   │     │      RuleEngine         │
+│  ConcurrentHashMap   │     │  Strategy + Observer    │
+│  Thread-safe state   │     │  Priority-sorted rules  │
+│  computeIfAbsent()   │     │  10s cooldown per user  │
+└──────────┬───────────┘     └───────────┬────────────┘
+           │                             │
+           ▼                             ▼
+┌──────────────────────┐     ┌────────────────────────┐
+│  SegmentClassifier   │     │    ActionDispatcher     │
+│  Real-time, per event│     │  TriggerEmailAction     │
+│  HIGH_VALUE          │     │  LogAction              │
+│  HOT_LEAD            │     │  (simulates SendGrid)   │
+│  CART_ABANDONER      │     └────────────────────────┘
+│  AT_RISK             │
+│  NEW_USER            │
+└──────────────────────┘
 
+┌─────────────────────────────────────────────────────┐
+│           PipelineDashboard (Daemon Thread)          │
+│    ScheduledExecutorService — fixed-rate 2s refresh  │
+│    Throughput / Segments / Top Users / Email Lists   │
+└─────────────────────────────────────────────────────┘
+</pre>
 
 ---
 
@@ -147,34 +175,56 @@ map.computeIfAbsent(userId, UserProfile::new);
 
 ## Project Structure
 
-src/main/java/com/aptroid/pipeline/
-├── model/
-│   ├── CustomerEvent.java       # Immutable — thread-safe by design
-│   ├── EventType.java           # Enum: PAGE_VIEW, CART_ADD, PURCHASE...
-│   ├── UserProfile.java         # AtomicInteger counters, volatile fields
-│   └── UserSegment.java         # HIGH_VALUE, HOT_LEAD, CART_ABANDONER...
-├── queue/
-│   ├── EventQueue.java          # Bounded BlockingQueue + back-pressure
-│   ├── EventProducer.java       # Runnable, weighted random events
-│   └── EventConsumer.java       # Runnable, profile update + rule eval
-├── engine/
-│   ├── RuleEngine.java          # Priority-sorted rules, cooldown logic
-│   ├── PipelineThreadPool.java  # Custom ThreadPoolExecutor
-│   └── rules/
-│       ├── Rule.java            # Strategy interface
-│       ├── CartAbandonRule.java
-│       ├── PricingPageRule.java
-│       └── HighValueUserRule.java
-├── action/
-│   ├── Action.java              # Observer interface
-│   ├── TriggerEmailAction.java  # Simulates email API
-│   └── LogAction.java           # Audit logging
-├── store/
-│   ├── UserProfileStore.java    # ConcurrentHashMap + query methods
-│   └── SegmentClassifier.java   # Real-time classification logic
-└── dashboard/
-└── PipelineDashboard.java   # ScheduledExecutorService, ANSI display
-
+<pre>
+behavioral-pipeline/
+│
+├── src/main/java/com/aptroid/pipeline/
+│   │
+│   ├── Main.java                        Entry point
+│   │
+│   ├── model/
+│   │   ├── CustomerEvent.java           Immutable event object (UUID, Instant, metadata)
+│   │   ├── EventType.java               Enum: PAGE_VIEW, CART_ADD, PURCHASE...
+│   │   ├── UserProfile.java             AtomicInteger counters, volatile fields
+│   │   └── UserSegment.java             HIGH_VALUE, HOT_LEAD, CART_ABANDONER...
+│   │
+│   ├── queue/
+│   │   ├── EventQueue.java              Bounded BlockingQueue + back-pressure logic
+│   │   ├── EventProducer.java           Runnable — weighted random event generator
+│   │   └── EventConsumer.java           Runnable — profile update + rule evaluation
+│   │
+│   ├── engine/
+│   │   ├── PipelineThreadPool.java      Custom ThreadPoolExecutor configuration
+│   │   ├── RuleEngine.java              Priority-sorted rules + cooldown mechanism
+│   │   └── rules/
+│   │       ├── Rule.java                Strategy interface
+│   │       ├── CartAbandonRule.java     Fires on cart abandonment
+│   │       ├── PricingPageRule.java     Fires on repeated pricing page views
+│   │       └── HighValueUserRule.java   Fires when engagement score exceeds threshold
+│   │
+│   ├── action/
+│   │   ├── Action.java                  Observer interface
+│   │   ├── TriggerEmailAction.java      Simulates SendGrid / Mailchimp API call
+│   │   └── LogAction.java               Audit trail logging
+│   │
+│   ├── store/
+│   │   ├── UserProfileStore.java        ConcurrentHashMap store + query methods
+│   │   └── SegmentClassifier.java       Real-time classification after every event
+│   │
+│   └── dashboard/
+│       └── PipelineDashboard.java       Live CLI — ScheduledExecutorService refresh
+│
+├── screenshots/
+│   ├── screenshot-structure.png
+│   ├── screenshot-startup.png
+│   ├── screenshot-dashboard.png
+│   ├── screenshot-emails.png
+│   ├── screenshot-final-report.png
+│   └── screenshot-segments.png
+│
+├── pom.xml                              Maven — Java 21, JUnit 5
+└── README.md
+</pre>
 
 ---
 
